@@ -85,7 +85,7 @@ fn init_tracing() {
 #[derive(Debug, Clone)]
 struct Config {
     curseforge_api_key: String,
-    discord_webhook_url: String,
+    discord_webhook_urls: Vec<String>,
     discord_username: Option<String>,
     redis_url: String,
     redis_seen_key: String,
@@ -103,8 +103,16 @@ impl Config {
     fn from_env() -> Result<Self> {
         let curseforge_api_key =
             env::var("CURSEFORGE_API_KEY").context("CURSEFORGE_API_KEY is not set")?;
-        let discord_webhook_url =
-            env::var("DISCORD_WEBHOOK_URL").context("DISCORD_WEBHOOK_URL is not set")?;
+        let discord_webhook_urls = env::var("DISCORD_WEBHOOK_URL")
+            .context("DISCORD_WEBHOOK_URL is not set")?
+            .split(',')
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>();
+        if discord_webhook_urls.is_empty() {
+            bail!("DISCORD_WEBHOOK_URL must contain at least one URL");
+        }
 
         let discord_username = env::var("DISCORD_USERNAME").ok().and_then(|value| {
             let trimmed = value.trim();
@@ -136,7 +144,7 @@ impl Config {
 
         Ok(Self {
             curseforge_api_key,
-            discord_webhook_url,
+            discord_webhook_urls,
             discord_username,
             redis_url,
             redis_seen_key,
@@ -396,48 +404,69 @@ async fn send_discord_notification(
         allowed_mentions: DiscordAllowedMentions { parse: Vec::new() },
     };
 
-    let mut attempts = 0usize;
+    for webhook_url in &config.discord_webhook_urls {
+        let mut attempts = 0usize;
 
-    loop {
-        attempts += 1;
+        loop {
+            attempts += 1;
 
-        let response = client
-            .post(&config.discord_webhook_url)
-            .json(&payload)
-            .send()
-            .await
-            .context("failed to send Discord webhook request")?;
+            let response = client
+                .post(webhook_url)
+                .json(&payload)
+                .send()
+                .await
+                .with_context(|| {
+                    format!("failed to send Discord webhook request to {webhook_url}")
+                })?;
 
-        let status = response.status();
+            let status = response.status();
 
-        if status.is_success() {
-            return Ok(());
-        }
+            if status.is_success() {
+                debug!(
+                    attempt = attempts,
+                    webhook_url = %webhook_url,
+                    "discord webhook delivered successfully"
+                );
+                break;
+            }
 
-        let retry_after_header = response
-            .headers()
-            .get(header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
+            let retry_after_header = response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
 
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<unable to read body>".to_string());
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unable to read body>".to_string());
 
-        if status.as_u16() == 429 && attempts < DISCORD_MAX_RETRIES {
-            let wait = parse_retry_after_delay(retry_after_header.as_deref(), &body);
-            debug!(
+            if status.as_u16() == 429 && attempts < DISCORD_MAX_RETRIES {
+                let wait = parse_retry_after_delay(retry_after_header.as_deref(), &body);
+                debug!(
+                    attempt = attempts,
+                    wait_ms = wait.as_millis() as u64,
+                    webhook_url = %webhook_url,
+                    "discord rate limited; retrying"
+                );
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+
+            error!(
                 attempt = attempts,
-                wait_ms = wait.as_millis() as u64,
-                "discord rate limited; retrying"
+                status = %status,
+                webhook_url = %webhook_url,
+                body = %body,
+                "discord webhook request failed"
             );
-            tokio::time::sleep(wait).await;
-            continue;
+            bail!(
+                "Discord webhook request to {webhook_url} failed after {attempts} attempts ({status}): {body}"
+            );
         }
-
-        bail!("Discord webhook request failed ({status}): {body}");
     }
+
+    Ok(())
 }
 
 fn build_mod_url(mod_entry: &Mod) -> Option<String> {
