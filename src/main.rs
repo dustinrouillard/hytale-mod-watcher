@@ -87,6 +87,7 @@ struct Config {
     curseforge_api_key: String,
     discord_webhook_urls: Vec<String>,
     discord_username: Option<String>,
+    discord_avatar_url: Option<String>,
     redis_url: String,
     redis_seen_key: String,
     poll_interval: Duration,
@@ -123,6 +124,15 @@ impl Config {
             }
         });
 
+        let discord_avatar_url = env::var("DISCORD_AVATAR_URL").ok().and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+
         let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/0".to_string());
         let redis_seen_key = env::var("REDIS_SEEN_KEY")
             .unwrap_or_else(|_| "hytale-mod-watcher:seen-mods".to_string());
@@ -146,6 +156,7 @@ impl Config {
             curseforge_api_key,
             discord_webhook_urls,
             discord_username,
+            discord_avatar_url,
             redis_url,
             redis_seen_key,
             poll_interval,
@@ -399,6 +410,7 @@ async fn send_discord_notification(
 
     let payload = DiscordWebhookPayload {
         username: config.discord_username.clone(),
+        avatar_url: config.discord_avatar_url.clone(),
         content: None,
         embeds: vec![embed],
         allowed_mentions: DiscordAllowedMentions { parse: Vec::new() },
@@ -617,6 +629,8 @@ struct ModAuthor {
 struct DiscordWebhookPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    avatar_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
