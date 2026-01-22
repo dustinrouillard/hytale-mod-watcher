@@ -326,6 +326,7 @@ async fn poll_once(
     for mod_entry in unique_mods.into_values() {
         let mod_key = mod_entry.id.to_string();
         let fingerprint = mod_fingerprint(&mod_entry);
+        let slug = mod_entry.slug.as_deref();
 
         let previous_fingerprint: Option<String> = redis_conn
             .hget(&config.redis_last_seen_hash_key, &mod_key)
@@ -339,6 +340,17 @@ async fn poll_once(
         };
 
         if let Some(kind) = event_kind {
+            if matches!(kind, NotificationKind::ModUpdated)
+                && !updates_allowed_for_mod(slug, &webhook_configs)
+            {
+                debug!(
+                    mod_id = mod_entry.id,
+                    mod_slug = slug.unwrap_or("<unknown>"),
+                    "update skipped; slug not in any included_mods list"
+                );
+                continue;
+            }
+
             match kind {
                 NotificationKind::NewMod => outcome.new_mods += 1,
                 NotificationKind::ModUpdated => outcome.mod_updates += 1,
@@ -991,11 +1003,31 @@ impl WebhookConfig {
             return true;
         }
 
-        match slug {
-            Some(value) => self.included_mods.iter().any(|item| item == value),
-            None => false,
-        }
+        let slug = match slug {
+            Some(value) => value,
+            None => return false,
+        };
+
+        self.included_mods.iter().any(|item| item == slug)
     }
+}
+
+fn updates_allowed_for_mod(slug: Option<&str>, configs: &[WebhookConfig]) -> bool {
+    if configs
+        .iter()
+        .any(|cfg| cfg.notify_updates && cfg.included_mods.is_empty())
+    {
+        return true;
+    }
+
+    let slug = match slug {
+        Some(value) => value,
+        None => return false,
+    };
+
+    configs
+        .iter()
+        .any(|cfg| cfg.notify_updates && cfg.included_mods.iter().any(|item| item == slug))
 }
 
 #[derive(Debug, Deserialize)]
