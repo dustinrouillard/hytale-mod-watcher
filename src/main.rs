@@ -1,4 +1,9 @@
-use std::{env, str::FromStr, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    str::FromStr,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
@@ -7,13 +12,17 @@ use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use reqwest::{Client, Url, header};
 use serde::{Deserialize, Serialize};
+use sqlx::{FromRow, Pool, Postgres, postgres::PgPoolOptions};
 use tokio::time::{self, MissedTickBehavior};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
+use uuid::Uuid;
 
 const CURSEFORGE_SEARCH_ENDPOINT: &str = "https://api.curseforge.com/v1/mods/search";
 const DISCORD_EMBED_DESCRIPTION_LIMIT: usize = 2_048;
 const DISCORD_MAX_RETRIES: usize = 5;
+
+type PgPool = Pool<Postgres>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -24,16 +33,16 @@ async fn main() -> Result<()> {
     info!(
         game_id = config.game_id,
         poll_interval_secs = config.poll_interval.as_secs(),
-        prefill_on_startup = config.prefill_on_startup,
         sort_field = config.sort_field,
         sort_order = %config.sort_order,
         page_size = config.page_size,
+        max_pages = config.max_pages,
         "starting hytale mod watcher"
     );
 
-    let client = Client::builder()
+    let http_client = Client::builder()
         .user_agent(format!(
-            "hytale-mod-watcher/{} (+https://github.com/example/hytale-mod-watcher)",
+            "hytale-mod-watcher/{} (+https://github.com/dustinrouillard/hytale-mod-watcher)",
             env!("CARGO_PKG_VERSION")
         ))
         .build()
@@ -45,18 +54,25 @@ async fn main() -> Result<()> {
         .await
         .context("failed to connect to Redis")?;
 
+    let db_pool = PgPoolOptions::new()
+        .max_connections(config.database_max_connections)
+        .connect(&config.database_url)
+        .await
+        .context("failed to connect to PostgreSQL")?;
+    info!("connected to PostgreSQL and Redis");
+
     let mut interval = time::interval(config.poll_interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
-    let mut skip_notifications = config.prefill_on_startup;
 
     loop {
         interval.tick().await;
 
-        match poll_once(&client, &mut redis_conn, &config, skip_notifications).await {
+        match poll_once(&http_client, &mut redis_conn, &db_pool, &config).await {
             Ok(outcome) => {
                 info!(
-                    newly_seen = outcome.newly_seen,
+                    fetched_mods = outcome.fetched_mods,
+                    new_mods = outcome.new_mods,
+                    mod_updates = outcome.mod_updates,
                     notifications_sent = outcome.notifications_sent,
                     "poll cycle complete"
                 );
@@ -64,11 +80,6 @@ async fn main() -> Result<()> {
             Err(err) => {
                 error!(error = ?err, "poll cycle failed");
             }
-        }
-
-        if skip_notifications {
-            info!("prefill complete; subsequent new mods will trigger notifications");
-            skip_notifications = false;
         }
     }
 }
@@ -85,11 +96,10 @@ fn init_tracing() {
 #[derive(Debug, Clone)]
 struct Config {
     curseforge_api_key: String,
-    discord_webhook_urls: Vec<String>,
-    discord_username: Option<String>,
-    discord_avatar_url: Option<String>,
+    database_url: String,
+    database_max_connections: u32,
     redis_url: String,
-    redis_seen_key: String,
+    redis_last_seen_hash_key: String,
     poll_interval: Duration,
     game_id: u32,
     class_id: Option<u32>,
@@ -97,23 +107,40 @@ struct Config {
     sort_field: u8,
     sort_order: SortOrder,
     page_size: u32,
-    prefill_on_startup: bool,
+    max_pages: u32,
+    discord_username: Option<String>,
+    discord_avatar_url: Option<String>,
 }
 
 impl Config {
     fn from_env() -> Result<Self> {
         let curseforge_api_key =
             env::var("CURSEFORGE_API_KEY").context("CURSEFORGE_API_KEY is not set")?;
-        let discord_webhook_urls = env::var("DISCORD_WEBHOOK_URL")
-            .context("DISCORD_WEBHOOK_URL is not set")?
-            .split(',')
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-            .map(|value| value.to_string())
-            .collect::<Vec<_>>();
-        if discord_webhook_urls.is_empty() {
-            bail!("DISCORD_WEBHOOK_URL must contain at least one URL");
-        }
+        let database_url = env::var("DATABASE_URL").context("DATABASE_URL is not set")?;
+        let database_max_connections = parse_optional_env::<u32>("DATABASE_MAX_CONNECTIONS")?
+            .unwrap_or(5)
+            .clamp(1, 32);
+
+        let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/0".to_string());
+        let redis_last_seen_hash_key = env::var("REDIS_LAST_SEEN_HASH_KEY")
+            .unwrap_or_else(|_| "hytale-mod-watcher:mods:last-fingerprint".to_string());
+
+        let poll_interval_secs = parse_optional_env::<u64>("POLL_INTERVAL_SECS")?
+            .unwrap_or(300)
+            .max(10);
+        let poll_interval = Duration::from_secs(poll_interval_secs);
+
+        let game_id = parse_optional_env::<u32>("CURSEFORGE_GAME_ID")?.unwrap_or(70_216);
+        let class_id = parse_optional_env::<u32>("CURSEFORGE_CLASS_ID")?;
+        let category_id = parse_optional_env::<u32>("CURSEFORGE_CATEGORY_ID")?;
+        let sort_field = parse_optional_env::<u8>("CURSEFORGE_SORT_FIELD")?.unwrap_or(11);
+        let sort_order = SortOrder::try_from_env(env::var("CURSEFORGE_SORT_ORDER").ok())?;
+        let page_size = parse_optional_env::<u32>("CURSEFORGE_PAGE_SIZE")?
+            .unwrap_or(50)
+            .clamp(1, 50);
+        let max_pages = parse_optional_env::<u32>("CURSEFORGE_MAX_PAGES")?
+            .unwrap_or(1)
+            .clamp(1, 20);
 
         let discord_username = env::var("DISCORD_USERNAME").ok().and_then(|value| {
             let trimmed = value.trim();
@@ -133,32 +160,12 @@ impl Config {
             }
         });
 
-        let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/0".to_string());
-        let redis_seen_key = env::var("REDIS_SEEN_KEY")
-            .unwrap_or_else(|_| "hytale-mod-watcher:seen-mods".to_string());
-
-        let poll_interval_secs = parse_optional_env::<u64>("POLL_INTERVAL_SECS")?
-            .unwrap_or(300)
-            .max(10);
-        let poll_interval = Duration::from_secs(poll_interval_secs);
-
-        let game_id = parse_optional_env::<u32>("CURSEFORGE_GAME_ID")?.unwrap_or(70_216);
-        let class_id = parse_optional_env::<u32>("CURSEFORGE_CLASS_ID")?;
-        let category_id = parse_optional_env::<u32>("CURSEFORGE_CATEGORY_ID")?;
-        let sort_field = parse_optional_env::<u8>("CURSEFORGE_SORT_FIELD")?.unwrap_or(11);
-        let sort_order = SortOrder::try_from_env(env::var("CURSEFORGE_SORT_ORDER").ok())?;
-        let page_size = parse_optional_env::<u32>("CURSEFORGE_PAGE_SIZE")?
-            .unwrap_or(50)
-            .clamp(1, 50);
-        let prefill_on_startup = parse_bool_env("PREFILL_ON_STARTUP", true)?;
-
         Ok(Self {
             curseforge_api_key,
-            discord_webhook_urls,
-            discord_username,
-            discord_avatar_url,
+            database_url,
+            database_max_connections,
             redis_url,
-            redis_seen_key,
+            redis_last_seen_hash_key,
             poll_interval,
             game_id,
             class_id,
@@ -166,7 +173,9 @@ impl Config {
             sort_field,
             sort_order,
             page_size,
-            prefill_on_startup,
+            max_pages,
+            discord_username,
+            discord_avatar_url,
         })
     }
 }
@@ -232,97 +241,273 @@ where
     }
 }
 
-fn parse_bool_env(key: &str, default: bool) -> Result<bool> {
-    match env::var(key) {
-        Ok(value) => {
-            let normalized = value.trim().to_ascii_lowercase();
-            if normalized.is_empty() {
-                Ok(default)
-            } else if matches!(normalized.as_str(), "1" | "true" | "yes" | "on") {
-                Ok(true)
-            } else if matches!(normalized.as_str(), "0" | "false" | "no" | "off") {
-                Ok(false)
-            } else {
-                Err(anyhow!("invalid boolean value '{value}' for {key}"))
-            }
+#[derive(Debug, Default)]
+struct PollOutcome {
+    fetched_mods: usize,
+    new_mods: usize,
+    mod_updates: usize,
+    notifications_sent: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NotificationKind {
+    NewMod,
+    ModUpdated,
+}
+
+impl NotificationKind {
+    fn embed_color(self) -> u32 {
+        match self {
+            NotificationKind::NewMod => 0xF3_77_26,
+            NotificationKind::ModUpdated => 0x24_67_F3,
         }
-        Err(env::VarError::NotPresent) => Ok(default),
-        Err(env::VarError::NotUnicode(_)) => Err(anyhow!("{key} contains invalid UTF-8")),
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            NotificationKind::NewMod => "new_mod",
+            NotificationKind::ModUpdated => "mod_update",
+        }
     }
 }
 
-#[derive(Debug, Default)]
-struct PollOutcome {
-    newly_seen: usize,
-    notifications_sent: usize,
+impl std::fmt::Display for NotificationKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 async fn poll_once(
     client: &Client,
     redis_conn: &mut ConnectionManager,
+    db_pool: &PgPool,
     config: &Config,
-    skip_notifications: bool,
 ) -> Result<PollOutcome> {
-    let mods = fetch_mods(client, config).await?;
-    debug!(mod_count = mods.len(), "received mods from CurseForge");
+    let webhook_configs = load_webhook_configs(db_pool).await?;
+    if webhook_configs.is_empty() {
+        debug!("no webhook configurations found; skipping cycle");
+        return Ok(PollOutcome::default());
+    }
 
-    let mut outcome = PollOutcome::default();
+    let mut watched_slugs = HashSet::new();
 
+    for cfg in &webhook_configs {
+        if !cfg.included_mods.is_empty() {
+            for slug in &cfg.included_mods {
+                watched_slugs.insert(slug.clone());
+            }
+        }
+    }
+
+    let mut mods = fetch_recent_mods(client, config).await?;
+
+    for slug in watched_slugs {
+        match fetch_mod_by_slug(client, config, &slug).await? {
+            Some(mod_entry) => mods.push(mod_entry),
+            None => warn!(%slug, "no CurseForge mod found for slug"),
+        }
+    }
+
+    if mods.is_empty() {
+        debug!("no mods fetched this cycle");
+        return Ok(PollOutcome::default());
+    }
+
+    let mut unique_mods: HashMap<i64, Mod> = HashMap::new();
     for mod_entry in mods {
-        let added_count: i32 = redis_conn
-            .sadd(&config.redis_seen_key, mod_entry.id)
+        unique_mods.entry(mod_entry.id).or_insert(mod_entry);
+    }
+
+    let mut outcome = PollOutcome {
+        fetched_mods: unique_mods.len(),
+        ..Default::default()
+    };
+
+    for mod_entry in unique_mods.into_values() {
+        let mod_key = mod_entry.id.to_string();
+        let fingerprint = mod_fingerprint(&mod_entry);
+
+        let previous_fingerprint: Option<String> = redis_conn
+            .hget(&config.redis_last_seen_hash_key, &mod_key)
             .await
-            .context("failed to update Redis seen set")?;
-        let was_added = added_count > 0;
+            .context("failed to read mod fingerprint from Redis")?;
 
-        if was_added {
-            outcome.newly_seen += 1;
+        let event_kind = match previous_fingerprint {
+            None => Some(NotificationKind::NewMod),
+            Some(ref prev) if prev != &fingerprint => Some(NotificationKind::ModUpdated),
+            _ => None,
+        };
 
-            if skip_notifications {
-                debug!(
-                    mod_id = mod_entry.id,
-                    mod_name = %mod_entry.name,
-                    "prefill mode: marked mod as seen"
-                );
-                continue;
+        if let Some(kind) = event_kind {
+            match kind {
+                NotificationKind::NewMod => outcome.new_mods += 1,
+                NotificationKind::ModUpdated => outcome.mod_updates += 1,
             }
 
-            send_discord_notification(client, config, &mod_entry).await?;
-            outcome.notifications_sent += 1;
+            let latest_file = match resolve_latest_file(client, config, &mod_entry).await {
+                Ok(info) => info,
+                Err(err) => {
+                    warn!(
+                        mod_id = mod_entry.id,
+                        error = ?err,
+                        "failed to resolve latest file metadata; continuing without download link"
+                    );
+                    None
+                }
+            };
 
-            info!(
-                mod_id = mod_entry.id,
-                mod_name = %mod_entry.name,
-                "sent discord notification for new mod"
-            );
-        } else {
-            debug!(
-                mod_id = mod_entry.id,
-                mod_name = %mod_entry.name,
-                "mod already seen; skipping"
-            );
+            let notifications_sent = dispatch_notifications(
+                client,
+                config,
+                &webhook_configs,
+                &mod_entry,
+                kind,
+                latest_file.as_ref(),
+            )
+            .await?;
+
+            outcome.notifications_sent += notifications_sent;
+
+            if notifications_sent == 0 {
+                debug!(
+                    mod_id = mod_entry.id,
+                    mod_slug = mod_entry.slug.as_deref().unwrap_or("<unknown>"),
+                    event = %kind,
+                    "no webhooks interested in this event"
+                );
+            }
         }
+
+        let _: () = redis_conn
+            .hset(&config.redis_last_seen_hash_key, &mod_key, &fingerprint)
+            .await
+            .context("failed to persist mod fingerprint to Redis")?;
     }
 
     Ok(outcome)
 }
 
-async fn fetch_mods(client: &Client, config: &Config) -> Result<Vec<Mod>> {
+async fn load_webhook_configs(pool: &PgPool) -> Result<Vec<WebhookConfig>> {
+    const QUERY: &str = r#"
+        SELECT
+            id,
+            webhook_id,
+            webhook_url,
+            notify_new_mods,
+            notify_updates,
+            COALESCE(included_mods, '{}'::text[]) AS included_mods
+        FROM webhook_configs
+        WHERE notify_new_mods = TRUE OR notify_updates = TRUE
+    "#;
+
+    let configs = sqlx::query_as::<_, WebhookConfig>(QUERY)
+        .fetch_all(pool)
+        .await
+        .context("failed to fetch webhook configurations")?;
+
+    Ok(configs)
+}
+
+async fn dispatch_notifications(
+    client: &Client,
+    config: &Config,
+    webhook_configs: &[WebhookConfig],
+    mod_entry: &Mod,
+    kind: NotificationKind,
+    latest_file: Option<&LatestFileInfo>,
+) -> Result<usize> {
+    let slug = mod_entry.slug.as_deref();
+    let interested_configs = webhook_configs
+        .iter()
+        .filter(|cfg| cfg.is_interested_in(kind, slug))
+        .collect::<Vec<_>>();
+
+    if interested_configs.is_empty() {
+        return Ok(0);
+    }
+
+    let mut sent = 0usize;
+
+    for cfg in interested_configs {
+        send_discord_notification(client, config, cfg, mod_entry, kind, latest_file).await?;
+        sent += 1;
+    }
+
+    info!(
+        mod_id = mod_entry.id,
+        mod_slug = mod_entry.slug.as_deref().unwrap_or("<unknown>"),
+        event = %kind,
+        sent_to = sent,
+        "dispatched notifications"
+    );
+
+    Ok(sent)
+}
+
+async fn fetch_recent_mods(client: &Client, config: &Config) -> Result<Vec<Mod>> {
+    let mut collected = Vec::new();
+
+    for page_index in 0..config.max_pages {
+        let index = page_index * config.page_size;
+        let mut url = Url::parse(CURSEFORGE_SEARCH_ENDPOINT)
+            .context("failed to parse CurseForge search endpoint")?;
+
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs.append_pair("gameId", &config.game_id.to_string());
+            pairs.append_pair("sortField", &config.sort_field.to_string());
+            pairs.append_pair("sortOrder", config.sort_order.as_str());
+            pairs.append_pair("pageSize", &config.page_size.to_string());
+            pairs.append_pair("index", &index.to_string());
+
+            if let Some(class_id) = config.class_id {
+                pairs.append_pair("classId", &class_id.to_string());
+            }
+            if let Some(category_id) = config.category_id {
+                pairs.append_pair("categoryId", &category_id.to_string());
+            }
+        }
+
+        let response = client
+            .get(url)
+            .header("x-api-key", &config.curseforge_api_key)
+            .send()
+            .await
+            .context("failed to send CurseForge search request")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unable to read body>".to_string());
+            bail!("CurseForge search request failed ({status}): {body}");
+        }
+
+        let parsed = response
+            .json::<ModsSearchResponse>()
+            .await
+            .context("failed to deserialize CurseForge search response")?;
+
+        if parsed.data.is_empty() {
+            break;
+        }
+
+        collected.extend(parsed.data);
+    }
+
+    Ok(collected)
+}
+
+async fn fetch_mod_by_slug(client: &Client, config: &Config, slug: &str) -> Result<Option<Mod>> {
     let mut url = Url::parse(CURSEFORGE_SEARCH_ENDPOINT)
         .context("failed to parse CurseForge search endpoint")?;
 
     {
         let mut pairs = url.query_pairs_mut();
         pairs.append_pair("gameId", &config.game_id.to_string());
-        pairs.append_pair("sortField", &config.sort_field.to_string());
-        pairs.append_pair("sortOrder", config.sort_order.as_str());
-        pairs.append_pair("pageSize", &config.page_size.to_string());
-        if let Some(class_id) = config.class_id {
-            pairs.append_pair("classId", &class_id.to_string());
-        }
-        if let Some(category_id) = config.category_id {
-            pairs.append_pair("categoryId", &category_id.to_string());
-        }
+        pairs.append_pair("slug", slug);
+        pairs.append_pair("pageSize", "1");
     }
 
     let response = client
@@ -330,7 +515,7 @@ async fn fetch_mods(client: &Client, config: &Config) -> Result<Vec<Mod>> {
         .header("x-api-key", &config.curseforge_api_key)
         .send()
         .await
-        .context("failed to send CurseForge search request")?;
+        .context("failed to send CurseForge slug search request")?;
 
     let status = response.status();
     if !status.is_success() {
@@ -338,21 +523,30 @@ async fn fetch_mods(client: &Client, config: &Config) -> Result<Vec<Mod>> {
             .text()
             .await
             .unwrap_or_else(|_| "<unable to read body>".to_string());
-        bail!("CurseForge search request failed ({status}): {body}");
+        bail!("CurseForge slug search failed ({status}): {body}");
     }
 
     let parsed = response
         .json::<ModsSearchResponse>()
         .await
-        .context("failed to deserialize CurseForge search response")?;
+        .context("failed to deserialize slug search response")?;
 
-    Ok(parsed.data)
+    Ok(parsed.data.into_iter().find(|mod_entry| {
+        mod_entry
+            .slug
+            .as_deref()
+            .map(|value| value == slug)
+            .unwrap_or(false)
+    }))
 }
 
 async fn send_discord_notification(
     client: &Client,
     config: &Config,
+    webhook: &WebhookConfig,
     mod_entry: &Mod,
+    kind: NotificationKind,
+    latest_file: Option<&LatestFileInfo>,
 ) -> Result<()> {
     let mod_url = build_mod_url(mod_entry);
     let description = sanitize_summary(&mod_entry.summary);
@@ -382,26 +576,60 @@ async fn send_discord_notification(
         });
     }
 
-    let release_datetime = mod_entry
-        .date_released
-        .as_deref()
-        .and_then(parse_datetime)
-        .or_else(|| mod_entry.date_created.as_deref().and_then(parse_datetime));
-
-    if let Some(released_at) = release_datetime {
-        fields.push(DiscordEmbedField {
-            name: "Released".to_string(),
-            value: released_at.format("%Y-%m-%d %H:%M UTC").to_string(),
-            inline: true,
-        });
+    if let Some(file_info) = latest_file {
+        if let Some(version) = file_info.version.as_ref() {
+            fields.push(DiscordEmbedField {
+                name: "Version".to_string(),
+                value: version.clone(),
+                inline: true,
+            });
+        }
+        if let Some(download_url) = file_info.download_url.as_ref() {
+            fields.push(DiscordEmbedField {
+                name: "Download".to_string(),
+                value: format!("[Direct link]({download_url})"),
+                inline: true,
+            });
+        }
     }
 
+    match kind {
+        NotificationKind::NewMod => {
+            if let Some(released_at) = mod_entry
+                .date_released
+                .as_deref()
+                .and_then(parse_datetime)
+                .or_else(|| mod_entry.date_created.as_deref().and_then(parse_datetime))
+            {
+                fields.push(DiscordEmbedField {
+                    name: "Released".to_string(),
+                    value: released_at.format("%Y-%m-%d %H:%M UTC").to_string(),
+                    inline: true,
+                });
+            }
+        }
+        NotificationKind::ModUpdated => {
+            if let Some(updated_at) = mod_entry.date_modified.as_deref().and_then(parse_datetime) {
+                fields.push(DiscordEmbedField {
+                    name: "Updated".to_string(),
+                    value: updated_at.format("%Y-%m-%d %H:%M UTC").to_string(),
+                    inline: true,
+                });
+            }
+        }
+    }
+
+    let timestamp = mod_event_timestamp(mod_entry, kind).map(|dt| dt.to_rfc3339());
+
     let embed = DiscordEmbed {
-        title: mod_entry.name.clone(),
+        title: match kind {
+            NotificationKind::NewMod => format!("New mod: {}", mod_entry.name),
+            NotificationKind::ModUpdated => format!("Updated mod: {}", mod_entry.name),
+        },
         url: mod_url,
         description,
-        timestamp: release_datetime.map(|dt| dt.to_rfc3339()),
-        color: Some(0xf3_77_26),
+        timestamp,
+        color: Some(kind.embed_color()),
         fields,
         thumbnail: mod_entry.logo.as_ref().map(|logo| DiscordEmbedThumbnail {
             url: logo.url.clone(),
@@ -416,66 +644,71 @@ async fn send_discord_notification(
         allowed_mentions: DiscordAllowedMentions { parse: Vec::new() },
     };
 
-    for webhook_url in &config.discord_webhook_urls {
-        let mut attempts = 0usize;
+    let mut attempts = 0usize;
 
-        loop {
-            attempts += 1;
+    loop {
+        attempts += 1;
 
-            let response = client
-                .post(webhook_url)
-                .json(&payload)
-                .send()
-                .await
-                .with_context(|| {
-                    format!("failed to send Discord webhook request to {webhook_url}")
-                })?;
+        let response = client
+            .post(&webhook.webhook_url)
+            .json(&payload)
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to send Discord webhook request to {}",
+                    webhook.webhook_url
+                )
+            })?;
 
-            let status = response.status();
+        let status = response.status();
 
-            if status.is_success() {
-                debug!(
-                    attempt = attempts,
-                    webhook_url = %webhook_url,
-                    "discord webhook delivered successfully"
-                );
-                break;
-            }
-
-            let retry_after_header = response
-                .headers()
-                .get(header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unable to read body>".to_string());
-
-            if status.as_u16() == 429 && attempts < DISCORD_MAX_RETRIES {
-                let wait = parse_retry_after_delay(retry_after_header.as_deref(), &body);
-                debug!(
-                    attempt = attempts,
-                    wait_ms = wait.as_millis() as u64,
-                    webhook_url = %webhook_url,
-                    "discord rate limited; retrying"
-                );
-                tokio::time::sleep(wait).await;
-                continue;
-            }
-
-            error!(
+        if status.is_success() {
+            debug!(
                 attempt = attempts,
-                status = %status,
-                webhook_url = %webhook_url,
-                body = %body,
-                "discord webhook request failed"
+                webhook_uuid = %webhook.id,
+                webhook_discord_id = %webhook.webhook_id,
+                "discord webhook delivered successfully"
             );
-            bail!(
-                "Discord webhook request to {webhook_url} failed after {attempts} attempts ({status}): {body}"
-            );
+            break;
         }
+
+        let retry_after_header = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unable to read body>".to_string());
+
+        if status.as_u16() == 429 && attempts < DISCORD_MAX_RETRIES {
+            let wait = parse_retry_after_delay(retry_after_header.as_deref(), &body);
+            debug!(
+                attempt = attempts,
+                wait_ms = wait.as_millis() as u64,
+                webhook_uuid = %webhook.id,
+                webhook_discord_id = %webhook.webhook_id,
+                "discord rate limited; retrying"
+            );
+            tokio::time::sleep(wait).await;
+            continue;
+        }
+
+        warn!(
+            attempt = attempts,
+            status = %status,
+            webhook_uuid = %webhook.id,
+            webhook_discord_id = %webhook.webhook_id,
+            body = %body,
+            "discord webhook request failed"
+        );
+        bail!(
+            "Discord webhook request to {} failed after {attempts} attempts ({status}): {body}",
+            webhook.webhook_url
+        );
     }
 
     Ok(())
@@ -528,6 +761,23 @@ fn parse_datetime(input: &str) -> Option<DateTime<Utc>> {
     None
 }
 
+fn mod_event_timestamp(mod_entry: &Mod, kind: NotificationKind) -> Option<DateTime<Utc>> {
+    match kind {
+        NotificationKind::NewMod => mod_entry
+            .date_created
+            .as_deref()
+            .and_then(parse_datetime)
+            .or_else(|| mod_entry.date_released.as_deref().and_then(parse_datetime))
+            .or_else(|| mod_entry.date_modified.as_deref().and_then(parse_datetime)),
+        NotificationKind::ModUpdated => mod_entry
+            .date_modified
+            .as_deref()
+            .and_then(parse_datetime)
+            .or_else(|| mod_entry.date_released.as_deref().and_then(parse_datetime))
+            .or_else(|| mod_entry.date_created.as_deref().and_then(parse_datetime)),
+    }
+}
+
 fn parse_retry_after_delay(header_value: Option<&str>, body: &str) -> Duration {
     if let Some(value) = header_value {
         if let Some(duration) = parse_seconds_str(value) {
@@ -572,12 +822,188 @@ fn format_number(value: u64) -> String {
     digits.into_iter().collect()
 }
 
+fn mod_fingerprint(mod_entry: &Mod) -> String {
+    mod_entry
+        .date_modified
+        .as_deref()
+        .or_else(|| mod_entry.date_released.as_deref())
+        .or_else(|| mod_entry.date_created.as_deref())
+        .map(|value| value.to_owned())
+        .unwrap_or_else(|| format!("id:{}:v1", mod_entry.id))
+}
+
+async fn resolve_latest_file(
+    client: &Client,
+    config: &Config,
+    mod_entry: &Mod,
+) -> Result<Option<LatestFileInfo>> {
+    if let Some(info) = select_latest_file(&mod_entry.latest_files) {
+        return Ok(Some(info));
+    }
+
+    let fetched_files = fetch_latest_files_from_api(client, config, mod_entry.id).await?;
+    Ok(select_latest_file(&fetched_files))
+}
+
+fn select_latest_file(files: &[ModFile]) -> Option<LatestFileInfo> {
+    let mut candidates: Vec<&ModFile> = files
+        .iter()
+        .filter(|file| {
+            file.download_url
+                .as_ref()
+                .map(|url| !url.is_empty())
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let jar_candidates: Vec<&ModFile> = candidates
+        .iter()
+        .copied()
+        .filter(|file| {
+            file.download_url
+                .as_deref()
+                .map(|url| url.ends_with(".jar"))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if !jar_candidates.is_empty() {
+        candidates = jar_candidates;
+    }
+
+    let best = candidates
+        .into_iter()
+        .max_by(|a, b| {
+            let a_date = a.file_date.as_deref().and_then(parse_datetime);
+            let b_date = b.file_date.as_deref().and_then(parse_datetime);
+            a_date.cmp(&b_date)
+        })
+        .unwrap();
+
+    let version = if !best.display_name.trim().is_empty() {
+        Some(best.display_name.clone())
+    } else if !best.file_name.trim().is_empty() {
+        Some(best.file_name.clone())
+    } else {
+        None
+    };
+
+    Some(LatestFileInfo {
+        version,
+        download_url: best.download_url.clone(),
+    })
+}
+
+async fn fetch_latest_files_from_api(
+    client: &Client,
+    config: &Config,
+    mod_id: i64,
+) -> Result<Vec<ModFile>> {
+    let mut url = Url::parse(&format!(
+        "https://api.curseforge.com/v1/mods/{mod_id}/files"
+    ))
+    .context("failed to parse CurseForge files endpoint")?;
+
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("pageSize", "20");
+        pairs.append_pair("sortOrder", config.sort_order.as_str());
+    }
+
+    let response = client
+        .get(url)
+        .header("x-api-key", &config.curseforge_api_key)
+        .send()
+        .await
+        .context("failed to send CurseForge files request")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unable to read body>".to_string());
+        bail!("CurseForge files request failed ({status}): {body}");
+    }
+
+    let parsed = response
+        .json::<FilesResponse>()
+        .await
+        .context("failed to deserialize CurseForge files response")?;
+
+    Ok(parsed.data)
+}
+
+#[derive(Debug, Clone)]
+struct LatestFileInfo {
+    version: Option<String>,
+    download_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FilesResponse {
+    data: Vec<ModFile>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ModFile {
+    #[serde(default)]
+    display_name: String,
+    #[serde(default)]
+    file_name: String,
+    #[serde(default)]
+    download_url: Option<String>,
+    #[serde(default)]
+    file_date: Option<String>,
+}
+
+#[derive(Debug, FromRow)]
+struct WebhookConfig {
+    id: Uuid,
+    webhook_id: String,
+    webhook_url: String,
+    notify_new_mods: bool,
+    notify_updates: bool,
+    included_mods: Vec<String>,
+}
+
+impl WebhookConfig {
+    fn is_interested_in(&self, kind: NotificationKind, slug: Option<&str>) -> bool {
+        let event_enabled = match kind {
+            NotificationKind::NewMod => self.notify_new_mods,
+            NotificationKind::ModUpdated => self.notify_updates,
+        };
+
+        if !event_enabled {
+            return false;
+        }
+
+        if matches!(kind, NotificationKind::NewMod) {
+            return true;
+        }
+
+        if self.included_mods.is_empty() {
+            return true;
+        }
+
+        match slug {
+            Some(value) => self.included_mods.iter().any(|item| item == value),
+            None => false,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ModsSearchResponse {
     data: Vec<Mod>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct Mod {
     id: i64,
@@ -601,24 +1027,27 @@ struct Mod {
     #[serde(default)]
     logo: Option<ModLogo>,
     #[serde(default)]
+    latest_files: Vec<ModFile>,
+    #[serde(default)]
     total_downloads: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ModLinks {
     #[serde(default)]
     website_url: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ModLogo {
     url: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct ModAuthor {
     name: String,
     #[serde(default)]
