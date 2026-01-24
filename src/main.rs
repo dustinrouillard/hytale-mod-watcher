@@ -289,14 +289,12 @@ async fn poll_once(
         return Ok(PollOutcome::default());
     }
 
-    let mut watched_slugs = HashSet::new();
+    let mut watched_ids = HashSet::new();
+    let mut legacy_watched_slugs = HashSet::new();
 
     for cfg in &webhook_configs {
-        if !cfg.included_mods.is_empty() {
-            for slug in &cfg.included_mods {
-                watched_slugs.insert(slug.clone());
-            }
-        }
+        watched_ids.extend(cfg.included_mod_ids.iter().copied());
+        legacy_watched_slugs.extend(cfg.legacy_included_mod_slugs.iter().cloned());
     }
 
     let mut tracked_mods: HashMap<i64, (Mod, bool)> = HashMap::new();
@@ -308,11 +306,29 @@ async fn poll_once(
             .or_insert((mod_entry, false));
     }
 
-    for slug in &watched_slugs {
+    for &mod_id in &watched_ids {
+        match fetch_mod_by_id(client, config, mod_id).await? {
+            Some(mod_entry) => match tracked_mods.entry(mod_entry.id) {
+                Entry::Occupied(mut entry) => {
+                    let entry_mut = entry.get_mut();
+                    entry_mut.0 = mod_entry;
+                    entry_mut.1 = true;
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert((mod_entry, true));
+                }
+            },
+            None => warn!(mod_id = mod_id, "no CurseForge mod found for ID"),
+        }
+    }
+
+    for slug in &legacy_watched_slugs {
         match fetch_mod_by_slug(client, config, slug).await? {
             Some(mod_entry) => match tracked_mods.entry(mod_entry.id) {
                 Entry::Occupied(mut entry) => {
-                    entry.get_mut().0 = mod_entry;
+                    let entry_mut = entry.get_mut();
+                    entry_mut.0 = mod_entry;
+                    entry_mut.1 = true;
                 }
                 Entry::Vacant(entry) => {
                     entry.insert((mod_entry, true));
@@ -371,12 +387,12 @@ async fn poll_once(
 
         if let Some(kind) = event_kind {
             if matches!(kind, NotificationKind::ModUpdated)
-                && !updates_allowed_for_mod(slug, &webhook_configs)
+                && !updates_allowed_for_mod(mod_entry.id, slug, &webhook_configs)
             {
                 debug!(
                     mod_id = mod_id,
                     mod_slug = slug.unwrap_or("<unknown>"),
-                    "update skipped; slug not in any included_mods list"
+                    "update skipped; mod ID not in any watch list"
                 );
                 continue;
             }
@@ -438,10 +454,15 @@ async fn load_webhook_configs(pool: &PgPool) -> Result<Vec<WebhookConfig>> {
         WHERE notify_new_mods = TRUE OR notify_updates = TRUE
     "#;
 
-    let configs = sqlx::query_as::<_, WebhookConfig>(QUERY)
+    let rows = sqlx::query_as::<_, WebhookConfigRow>(QUERY)
         .fetch_all(pool)
         .await
         .context("failed to fetch webhook configurations")?;
+
+    let configs = rows
+        .into_iter()
+        .map(WebhookConfig::from_row)
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(configs)
 }
@@ -457,7 +478,7 @@ async fn dispatch_notifications(
     let slug = mod_entry.slug.as_deref();
     let interested_configs = webhook_configs
         .iter()
-        .filter(|cfg| cfg.is_interested_in(kind, slug))
+        .filter(|cfg| cfg.is_interested_in(kind, mod_entry.id, slug))
         .collect::<Vec<_>>();
 
     if interested_configs.is_empty() {
@@ -535,6 +556,37 @@ async fn fetch_recent_mods(client: &Client, config: &Config) -> Result<Vec<Mod>>
     }
 
     Ok(collected)
+}
+
+async fn fetch_mod_by_id(client: &Client, config: &Config, mod_id: i64) -> Result<Option<Mod>> {
+    let url = Url::parse(&format!("https://api.curseforge.com/v1/mods/{mod_id}"))
+        .context("failed to parse CurseForge mod endpoint")?;
+
+    let response = client
+        .get(url)
+        .header("x-api-key", &config.curseforge_api_key)
+        .send()
+        .await
+        .with_context(|| format!("failed to send CurseForge mod request for ID {mod_id}"))?;
+
+    let status = response.status();
+    if status.as_u16() == 404 {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unable to read body>".to_string());
+        bail!("CurseForge mod request for ID {mod_id} failed ({status}): {body}");
+    }
+
+    let parsed = response
+        .json::<ModResponse>()
+        .await
+        .context("failed to deserialize CurseForge mod response")?;
+
+    Ok(Some(parsed.data))
 }
 
 async fn fetch_mod_by_slug(client: &Client, config: &Config, slug: &str) -> Result<Option<Mod>> {
@@ -1091,8 +1143,19 @@ struct ModFile {
     file_date: Option<String>,
 }
 
-#[derive(Debug, FromRow)]
+#[derive(Debug)]
 struct WebhookConfig {
+    id: Uuid,
+    webhook_id: String,
+    webhook_url: String,
+    notify_new_mods: bool,
+    notify_updates: bool,
+    included_mod_ids: HashSet<i64>,
+    legacy_included_mod_slugs: HashSet<String>,
+}
+
+#[derive(Debug, FromRow)]
+struct WebhookConfigRow {
     id: Uuid,
     webhook_id: String,
     webhook_url: String,
@@ -1102,7 +1165,47 @@ struct WebhookConfig {
 }
 
 impl WebhookConfig {
-    fn is_interested_in(&self, kind: NotificationKind, slug: Option<&str>) -> bool {
+    fn from_row(row: WebhookConfigRow) -> Result<Self> {
+        let mut included_ids = HashSet::new();
+        let mut legacy_slugs = HashSet::new();
+
+        for value in row.included_mods {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            if let Ok(id) = trimmed.parse::<i64>() {
+                included_ids.insert(id);
+            } else {
+                legacy_slugs.insert(trimmed.to_string());
+            }
+        }
+
+        if !legacy_slugs.is_empty() {
+            warn!(
+                webhook_uuid = %row.id,
+                slug_filters = legacy_slugs.len(),
+                "webhook configuration still uses slug filters; please migrate to CurseForge mod IDs"
+            );
+        }
+
+        Ok(Self {
+            id: row.id,
+            webhook_id: row.webhook_id,
+            webhook_url: row.webhook_url,
+            notify_new_mods: row.notify_new_mods,
+            notify_updates: row.notify_updates,
+            included_mod_ids: included_ids,
+            legacy_included_mod_slugs: legacy_slugs,
+        })
+    }
+
+    fn includes_all(&self) -> bool {
+        self.included_mod_ids.is_empty() && self.legacy_included_mod_slugs.is_empty()
+    }
+
+    fn is_interested_in(&self, kind: NotificationKind, mod_id: i64, slug: Option<&str>) -> bool {
         let event_enabled = match kind {
             NotificationKind::NewMod => self.notify_new_mods,
             NotificationKind::ModUpdated => self.notify_updates,
@@ -1116,35 +1219,54 @@ impl WebhookConfig {
             return true;
         }
 
-        if self.included_mods.is_empty() {
+        if self.includes_all() {
             return true;
         }
 
-        let slug = match slug {
-            Some(value) => value,
-            None => return false,
-        };
+        if self.included_mod_ids.contains(&mod_id) {
+            return true;
+        }
 
-        self.included_mods.iter().any(|item| item == slug)
+        if let Some(slug_value) = slug {
+            if self.legacy_included_mod_slugs.contains(slug_value) {
+                return true;
+            }
+        }
+
+        false
     }
 }
 
-fn updates_allowed_for_mod(slug: Option<&str>, configs: &[WebhookConfig]) -> bool {
+fn updates_allowed_for_mod(mod_id: i64, slug: Option<&str>, configs: &[WebhookConfig]) -> bool {
     if configs
         .iter()
-        .any(|cfg| cfg.notify_updates && cfg.included_mods.is_empty())
+        .any(|cfg| cfg.notify_updates && cfg.includes_all())
     {
         return true;
     }
 
-    let slug = match slug {
-        Some(value) => value,
-        None => return false,
-    };
+    configs.iter().any(|cfg| {
+        if !cfg.notify_updates {
+            return false;
+        }
 
-    configs
-        .iter()
-        .any(|cfg| cfg.notify_updates && cfg.included_mods.iter().any(|item| item == slug))
+        if cfg.included_mod_ids.contains(&mod_id) {
+            return true;
+        }
+
+        if let Some(slug_value) = slug {
+            if cfg.legacy_included_mod_slugs.contains(slug_value) {
+                return true;
+            }
+        }
+
+        false
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct ModResponse {
+    data: Mod,
 }
 
 #[derive(Debug, Deserialize)]
