@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::Entry},
     env,
     str::FromStr,
     time::Duration,
@@ -299,34 +299,51 @@ async fn poll_once(
         }
     }
 
-    let mut mods = fetch_recent_mods(client, config).await?;
+    let mut tracked_mods: HashMap<i64, (Mod, bool)> = HashMap::new();
 
-    for slug in watched_slugs {
-        match fetch_mod_by_slug(client, config, &slug).await? {
-            Some(mod_entry) => mods.push(mod_entry),
-            None => warn!(%slug, "no CurseForge mod found for slug"),
+    let recent_mods = fetch_recent_mods(client, config).await?;
+    for mod_entry in recent_mods {
+        tracked_mods
+            .entry(mod_entry.id)
+            .or_insert((mod_entry, false));
+    }
+
+    for slug in &watched_slugs {
+        match fetch_mod_by_slug(client, config, slug).await? {
+            Some(mod_entry) => match tracked_mods.entry(mod_entry.id) {
+                Entry::Occupied(mut entry) => {
+                    entry.get_mut().0 = mod_entry;
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert((mod_entry, true));
+                }
+            },
+            None => warn!(slug = %slug, "no CurseForge mod found for slug"),
         }
     }
 
-    if mods.is_empty() {
+    if tracked_mods.is_empty() {
         debug!("no mods fetched this cycle");
         return Ok(PollOutcome::default());
     }
 
-    let mut unique_mods: HashMap<i64, Mod> = HashMap::new();
-    for mod_entry in mods {
-        unique_mods.entry(mod_entry.id).or_insert(mod_entry);
-    }
-
     let mut outcome = PollOutcome {
-        fetched_mods: unique_mods.len(),
+        fetched_mods: tracked_mods.len(),
         ..Default::default()
     };
 
-    for mod_entry in unique_mods.into_values() {
-        let mod_key = mod_entry.id.to_string();
-        let fingerprint = mod_fingerprint(&mod_entry);
+    for (mod_id, (mod_entry, watchlist_sourced)) in tracked_mods.into_iter() {
+        let mod_key = mod_id.to_string();
         let slug = mod_entry.slug.as_deref();
+
+        let (latest_file, latest_file_error) =
+            match resolve_latest_file(client, config, &mod_entry).await {
+                Ok(info) => (info, None),
+                Err(err) => (None, Some(err)),
+            };
+
+        let new_fingerprint = mod_fingerprint(&mod_entry, latest_file.as_ref());
+        let legacy_fingerprint = legacy_mod_fingerprint(&mod_entry);
 
         let previous_fingerprint: Option<String> = redis_conn
             .hget(&config.redis_last_seen_hash_key, &mod_key)
@@ -334,8 +351,21 @@ async fn poll_once(
             .context("failed to read mod fingerprint from Redis")?;
 
         let event_kind = match previous_fingerprint {
-            None => Some(NotificationKind::NewMod),
-            Some(ref prev) if prev != &fingerprint => Some(NotificationKind::ModUpdated),
+            None => {
+                if watchlist_sourced {
+                    debug!(
+                        mod_id = mod_id,
+                        mod_slug = slug.unwrap_or("<unknown>"),
+                        "skipping initial notification for newly watched mod"
+                    );
+                    None
+                } else {
+                    Some(NotificationKind::NewMod)
+                }
+            }
+            Some(ref prev) if prev != &new_fingerprint && prev != &legacy_fingerprint => {
+                Some(NotificationKind::ModUpdated)
+            }
             _ => None,
         };
 
@@ -344,29 +374,25 @@ async fn poll_once(
                 && !updates_allowed_for_mod(slug, &webhook_configs)
             {
                 debug!(
-                    mod_id = mod_entry.id,
+                    mod_id = mod_id,
                     mod_slug = slug.unwrap_or("<unknown>"),
                     "update skipped; slug not in any included_mods list"
                 );
                 continue;
             }
 
+            if let Some(err) = latest_file_error.as_ref() {
+                warn!(
+                    mod_id = mod_id,
+                    error = ?err,
+                    "failed to resolve latest file metadata; continuing without download link"
+                );
+            }
+
             match kind {
                 NotificationKind::NewMod => outcome.new_mods += 1,
                 NotificationKind::ModUpdated => outcome.mod_updates += 1,
             }
-
-            let latest_file = match resolve_latest_file(client, config, &mod_entry).await {
-                Ok(info) => info,
-                Err(err) => {
-                    warn!(
-                        mod_id = mod_entry.id,
-                        error = ?err,
-                        "failed to resolve latest file metadata; continuing without download link"
-                    );
-                    None
-                }
-            };
 
             let notifications_sent = dispatch_notifications(
                 client,
@@ -382,8 +408,8 @@ async fn poll_once(
 
             if notifications_sent == 0 {
                 debug!(
-                    mod_id = mod_entry.id,
-                    mod_slug = mod_entry.slug.as_deref().unwrap_or("<unknown>"),
+                    mod_id = mod_id,
+                    mod_slug = slug.unwrap_or("<unknown>"),
                     event = %kind,
                     "no webhooks interested in this event"
                 );
@@ -391,7 +417,7 @@ async fn poll_once(
         }
 
         let _: () = redis_conn
-            .hset(&config.redis_last_seen_hash_key, &mod_key, &fingerprint)
+            .hset(&config.redis_last_seen_hash_key, &mod_key, &new_fingerprint)
             .await
             .context("failed to persist mod fingerprint to Redis")?;
     }
@@ -834,30 +860,7 @@ fn format_number(value: u64) -> String {
     digits.into_iter().collect()
 }
 
-fn mod_fingerprint(mod_entry: &Mod) -> String {
-    mod_entry
-        .date_modified
-        .as_deref()
-        .or_else(|| mod_entry.date_released.as_deref())
-        .or_else(|| mod_entry.date_created.as_deref())
-        .map(|value| value.to_owned())
-        .unwrap_or_else(|| format!("id:{}:v1", mod_entry.id))
-}
-
-async fn resolve_latest_file(
-    client: &Client,
-    config: &Config,
-    mod_entry: &Mod,
-) -> Result<Option<LatestFileInfo>> {
-    if let Some(info) = select_latest_file(&mod_entry.latest_files) {
-        return Ok(Some(info));
-    }
-
-    let fetched_files = fetch_latest_files_from_api(client, config, mod_entry.id).await?;
-    Ok(select_latest_file(&fetched_files))
-}
-
-fn select_latest_file(files: &[ModFile]) -> Option<LatestFileInfo> {
+fn best_mod_file<'a>(files: &'a [ModFile]) -> Option<&'a ModFile> {
     let mut candidates: Vec<&ModFile> = files
         .iter()
         .filter(|file| {
@@ -887,26 +890,134 @@ fn select_latest_file(files: &[ModFile]) -> Option<LatestFileInfo> {
         candidates = jar_candidates;
     }
 
-    let best = candidates
-        .into_iter()
-        .max_by(|a, b| {
-            let a_date = a.file_date.as_deref().and_then(parse_datetime);
-            let b_date = b.file_date.as_deref().and_then(parse_datetime);
-            a_date.cmp(&b_date)
-        })
-        .unwrap();
+    candidates.into_iter().max_by(|a, b| {
+        let a_date = a.file_date.as_deref().and_then(parse_datetime);
+        let b_date = b.file_date.as_deref().and_then(parse_datetime);
+        a_date.cmp(&b_date)
+    })
+}
 
-    let version = if !best.display_name.trim().is_empty() {
-        Some(best.display_name.clone())
-    } else if !best.file_name.trim().is_empty() {
-        Some(best.file_name.clone())
-    } else {
+fn non_empty_string(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
         None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+fn legacy_mod_fingerprint(mod_entry: &Mod) -> String {
+    mod_entry
+        .date_modified
+        .as_deref()
+        .or_else(|| mod_entry.date_released.as_deref())
+        .or_else(|| mod_entry.date_created.as_deref())
+        .map(|value| value.to_owned())
+        .unwrap_or_else(|| format!("id:{}:v1", mod_entry.id))
+}
+
+fn mod_fingerprint(mod_entry: &Mod, latest_file: Option<&LatestFileInfo>) -> String {
+    let summary = sanitize_summary(&mod_entry.summary);
+
+    let mut authors: Vec<String> = mod_entry
+        .authors
+        .iter()
+        .map(|author| author.name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .collect();
+    authors.sort();
+    authors.dedup();
+
+    let best_file = match latest_file {
+        Some(file) => {
+            if file.version.is_some()
+                || file
+                    .file_name
+                    .as_ref()
+                    .map(|name| !name.is_empty())
+                    .unwrap_or(false)
+                || file
+                    .display_name
+                    .as_ref()
+                    .map(|name| !name.is_empty())
+                    .unwrap_or(false)
+                || file
+                    .download_url
+                    .as_ref()
+                    .map(|url| !url.is_empty())
+                    .unwrap_or(false)
+                || file.file_date.is_some()
+                || file.file_id.is_some()
+            {
+                Some(serde_json::json!({
+                    "id": file.file_id,
+                    "version": file.version.clone(),
+                    "file_name": file.file_name.clone(),
+                    "display_name": file.display_name.clone(),
+                    "download_url": file.download_url.clone(),
+                    "file_date": file.file_date.clone(),
+                }))
+            } else {
+                None
+            }
+        }
+        None => best_mod_file(&mod_entry.latest_files).map(|file| {
+            serde_json::json!({
+                "id": if file.id > 0 { Some(file.id) } else { None },
+                "display_name": non_empty_string(&file.display_name),
+                "file_name": non_empty_string(&file.file_name),
+                "download_url": file.download_url.clone(),
+                "file_date": file.file_date.clone(),
+            })
+        }),
     };
 
+    serde_json::json!({
+        "v": 2,
+        "id": mod_entry.id,
+        "name": mod_entry.name.trim(),
+        "slug": mod_entry.slug.clone(),
+        "website_url": mod_entry.website_url.clone(),
+        "links_website_url": mod_entry.links.as_ref().and_then(|links| links.website_url.clone()),
+        "logo_url": mod_entry.logo.as_ref().map(|logo| logo.url.clone()),
+        "summary": summary,
+        "authors": authors,
+        "total_downloads": mod_entry.total_downloads,
+        "date_created": mod_entry.date_created.clone(),
+        "date_modified": mod_entry.date_modified.clone(),
+        "date_released": mod_entry.date_released.clone(),
+        "best_file": best_file,
+    })
+    .to_string()
+}
+
+async fn resolve_latest_file(
+    client: &Client,
+    config: &Config,
+    mod_entry: &Mod,
+) -> Result<Option<LatestFileInfo>> {
+    if let Some(info) = select_latest_file(&mod_entry.latest_files) {
+        return Ok(Some(info));
+    }
+
+    let fetched_files = fetch_latest_files_from_api(client, config, mod_entry.id).await?;
+    Ok(select_latest_file(&fetched_files))
+}
+
+fn select_latest_file(files: &[ModFile]) -> Option<LatestFileInfo> {
+    let best = best_mod_file(files)?;
+
+    let display_name = non_empty_string(&best.display_name);
+    let file_name = non_empty_string(&best.file_name);
+    let version = display_name.clone().or_else(|| file_name.clone());
+
     Some(LatestFileInfo {
+        file_id: if best.id > 0 { Some(best.id) } else { None },
         version,
+        file_name,
+        display_name,
         download_url: best.download_url.clone(),
+        file_date: best.file_date.clone(),
     })
 }
 
@@ -952,8 +1063,12 @@ async fn fetch_latest_files_from_api(
 
 #[derive(Debug, Clone)]
 struct LatestFileInfo {
+    file_id: Option<i64>,
     version: Option<String>,
+    file_name: Option<String>,
+    display_name: Option<String>,
     download_url: Option<String>,
+    file_date: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -964,6 +1079,8 @@ struct FilesResponse {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ModFile {
+    #[serde(default)]
+    id: i64,
     #[serde(default)]
     display_name: String,
     #[serde(default)]
